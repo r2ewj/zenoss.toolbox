@@ -1,51 +1,110 @@
 #!/usr/bin/env python
 
 import argparse
+import datetime
 import os
 import subprocess
 import sys
 import tempfile
 
+def run_dmd(script_text, output_file):
+    script_file = tempfile.NamedTemporaryFile(delete=False, dir=os.getcwd())
+    try:
+        script_file.write(script_text)
+        script_file.close()
+        subprocess.call(['zendmd', '--script=%s' % script_file.name], stdout=output_file, stdin=subprocess.PIPE, stderr=None)
+    finally:
+        os.unlink(script_file.name)
+
 parser = argparse.ArgumentParser(description="4.x export script")
 
-default_export_fn = '4x-export.tar'
+thetime = datetime.datetime.now().strftime('%Y%m%d-%H%M%S')
 
-parser.add_argument('-e', '--existing', help='path to existing backup archive')
-parser.add_argument('-n', '--new', help='make a new backup archive', action='store_const', const=1)
-parser.add_argument('-f', '--filename', help='specify name of export file. export is created in the current directory. if unspecified, name is %s' % default_export_fn, default=default_export_fn)
-parser.add_argument('-s', '--skip-zodb', help='backup only events and perf, only helpful with -n', action='store_const', const=1)
+default_export_filename = '4x-export-%s.tar' % thetime
+
+parser.add_argument('-f', '--filename', help='specify name of export file. export is created in the current directory. if unspecified, name is 4x-export-YYmmdd-HHMMSS.tar', default=default_export_filename)
+parser.add_argument('-z', '--no-zodb', help="don't backup zodb.", action='store_const', const=1)
+parser.add_argument('-e', '--no-eventsdb', help="don't backup events.", action='store_const', const=1)
+parser.add_argument('-p', '--no-perfdata', help="don't backup perf data (won't backup remote collectors unnecessarily).", action='store_const', const=1)
 
 args = parser.parse_args()
 
-if not args.existing and not args.new:
-    print 'you must specify either an existing backup (-e ARCHIVE) or the creation of a new one (-n)'
+get_remote_collector_hostnames_dmd = '''
+import sys
+if not hasattr(dmd.Monitors, 'Hub'):
+    sys.stderr.write('Not using distributed collectors.\\n')
     sys.exit(0)
+colldict = {}
+for hub in dmd.Monitors.Hub.objectSubValues():
+    for collector in hub.collectors():
+        if collector.isLocalHost():
+            continue
+        if colldict.has_key(collector.hostname):
+            sys.stderr.write('collector %s shares a hostname with collector %s, skipping duplicate.\\n' % (collector.id, colldict[collector.hostname].id))
+            continue
+        colldict[collector.hostname] = collector
+if not colldict:
+    sys.stderr.write('All collectors are local.\\n')
+    sys.exit(0)
+for collector in colldict.values():
+    print ','.join([collector.hub().id, collector.id, collector.hostname])
+'''
 
-if args.existing:
-    if not os.path.exists(args.existing):
-        print 'a path was provided but does not contain a file'
-        sys.exit(1)
-    backup_fn = args.existing
-    print 'using provided backup'
+def get_collector_list():
+    collector_file = tempfile.NamedTemporaryFile(delete=False, dir=os.getcwd())
+    try:
+        run_dmd(get_remote_collector_hostnames_dmd, collector_file)
+    finally:
+        collector_file.close()
+    try:
+        with open(collector_file.name, 'r') as f:
+            collector_list = [l.strip() for l in f.readlines()]
+    finally:
+        os.unlink(collector_file.name)
+    return collector_list
 
-if args.new:
-    print 'making new backup ...'
-    backup_dir = os.path.join(os.environ['ZENHOME'], 'backups')
-    before_dir = set(os.listdir(backup_dir))
-    zbcommand = ['zenbackup']
-    if args.skip_zodb:
-        zbcommand.append('--no-zodb')
-    zbresult = subprocess.call(zbcommand)
-    if zbresult is not 0:
-        print 'no backup specified and making one failed, aborting ...'
-        sys.exit(1)
-    after_dir = set(os.listdir(backup_dir))
-    backup_fn = os.path.join(backup_dir, list(after_dir - before_dir)[0])
+backup_dir = os.path.join(os.environ['ZENHOME'], 'backups')
 
-components_file = 'componentList.txt'
-components_fn = os.path.join(os.getcwd(), components_file)
+remote_backups = []
 
-dmd_snippet = '''
+if not args.no_perfdata:
+    sys.stderr.write('Getting remote collector information.\n')
+    for line in get_collector_list():
+        hub, collector, hostname = line.split(',')
+        remote_backup_filename = '%s-%s-perf-backup-%s.tgz' % (hub, collector, thetime)
+        remote_backup_fn = os.path.join(backup_dir, remote_backup_filename)
+        remotebackupcmd = ['dc-admin', '--hub-pattern', hub, '--collector-pattern', collector, 'exec', '/opt/zenoss/bin/zenbackup', '--file=%s' % remote_backup_fn, '--no-eventsdb', '--no-zodb']
+        remotezbresult = subprocess.call(remotebackupcmd)
+        if remotezbresult is not 0:
+            print 'backup failed on remote collector %s, aborting ...' % collector
+            sys.exit(remotezbresult)
+        scpcmd = ['scp', 'zenoss@%s:%s' % (hostname, remote_backup_fn), '.']
+        scpresult = subprocess.call(scpcmd)
+        if scpresult is not 0:
+            print 'failed to scp backup %s from remote collector %s, aborting ...' % (remote_backup_filename, collector)
+            sys.exit(scpresult)
+        remote_backups.append(remote_backup_filename)
+
+print 'making new backup ...'
+before_dir = set(os.listdir(backup_dir))
+zbcommand = ['zenbackup']
+if args.no_zodb:
+    zbcommand.append('--no-zodb')
+if args.no_eventsdb:
+    zbcommand.append('--no-eventsdb')
+if args.no_perfdata:
+    zbcommand.append('--no-perfdata')
+zbresult = subprocess.call(zbcommand)
+if zbresult is not 0:
+    print 'no backup specified and making one failed, aborting ...'
+    sys.exit(zbresult)
+after_dir = set(os.listdir(backup_dir))
+backup_fn = os.path.join(backup_dir, list(after_dir - before_dir)[0])
+
+components_filename = 'componentList.txt'
+components_fn = os.path.join(os.getcwd(), components_filename)
+
+list_components_dmd = '''
 import sys
 devcount = 0
 for dev in dmd.Devices.getSubDevices():
@@ -61,19 +120,18 @@ sys.stderr.write('a total of %d devices in export\\n' % devcount)
 
 print 'exporting component list ...'
 
-script_file = tempfile.NamedTemporaryFile(delete=False, dir=os.getcwd())
-
+components_file = open(components_fn, 'w')
 try:
-    script_file.write(dmd_snippet)
-    script_file.close()
-    subprocess.call(['zendmd', '--script=%s' % script_file.name], stdout=open(components_fn, 'w'), stdin=subprocess.PIPE, stderr=None)
+    run_dmd(list_components_dmd, components_file)
 finally:
-    os.unlink(script_file.name)
+    components_file.close()
 
-tar_result = subprocess.call(['tar', 'cf', args.filename, components_file])
+tarcmd = ['tar', 'cf', args.filename, components_filename]
+tarcmd.extend(remote_backups)
+tar_result = subprocess.call(tarcmd)
 if tar_result is not 0:
     print 'failed to create tarfile'
-    sys.exit(1)
+    sys.exit(tar_result)
 
 print 'component list exported'
 
@@ -83,6 +141,6 @@ export_fn = os.path.join(os.getcwd(), args.filename)
 tar_result = subprocess.call(['tar', '-C', backup_split[0], '-uf', export_fn, backup_split[1]])
 if tar_result is not 0:
     print 'failed to add backup to tarfile'
-    sys.exit(1)
+    sys.exit(tar_result)
 
 print 'export successful. file is %s' % export_fn
