@@ -131,10 +131,12 @@ def reindex_dmd_objects(name, type, dmd, log):
             log.info("%d Devices reindexed successfully" % (output_count))
         dmd._p_jar.sync()
         transaction.commit()
+        return True
     except Exception as e:
         print " FAILED  (check log file for details)"
         log.error("%s.reIndex() failed" % (name))
         log.exception(e)
+        return False
 
 
 def parse_options():
@@ -190,7 +192,10 @@ def main():
         log.info("Zenreindextool finished - list of supported types output to CLI")
     else:
         if cli_options['type'] in types_to_reIndex.keys():
-            reindex_dmd_objects(cli_options['type'], types_to_reIndex[cli_options['type']], dmd, log)
+            any_issue = reindex_dmd_objects(cli_options['type'], types_to_reIndex[cli_options['type']], dmd, log)
+            # exit with error if there are any issues
+            if any_issue == False:
+            	exit(1)
         else:
             print("Type '%s' unrecognized - unable to reIndex()" % (cli_options['type']))
             log.error("CLI input '%s' doesn't match recognized types" % (cli_options['type']))
